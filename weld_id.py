@@ -1,46 +1,94 @@
-import fitz  # PyMuPDF
-import re
+import cv2
+import numpy as np
+import math
 
-# Regex to detect number with degree symbol (e.g., 30°, 12.5°, 3°)
-degree_pattern = re.compile(r"\b\d+(\.\d+)?°")
+def extend_line(x1, y1, x2, y2, scale=2000):
+    vx = x2 - x1
+    vy = y2 - y1
+    return (x1 - vx*scale, y1 - vy*scale, x2 + vx*scale, y2 + vy*scale)
 
-pdf_path = "drawing.pdf"
-doc = fitz.open(pdf_path)
+def intersection(l1, l2):
+    x1,y1,x2,y2 = l1
+    x3,y3,x4,y4 = l2
 
-results = []
+    denom = (x1-x2)*(y3-y4)-(y1-y2)*(x3-x4)
+    if abs(denom) < 1e-6:
+        return None
 
-for page_num, page in enumerate(doc):
-    text_instances = page.get_text("blocks")  # list of (x0, y0, x1, y1, text, block_no,..)
-    
-    for block in text_instances:
-        bbox = block[:4]
-        text = block[4]
+    px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom
+    py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom
 
-        # find all occurrences inside the text block
-        matches = degree_pattern.findall(text)
+    return (int(px), int(py))
 
-        # use re.finditer to get start/end positions
-        for match in re.finditer(degree_pattern, text):
-            matched_str = match.group()
-            start = match.start()
-            end = match.end()
+def detect_boxes_parallel_perpendicular(img_path):
+    img = cv2.imread(img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # get exact character-level bounding boxes
-            chars = page.get_text("chars")
-            char_boxes = [c for c in chars if c[4] in matched_str]
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
 
-            if char_boxes:
-                x0 = min(c[0] for c in char_boxes)
-                y0 = min(c[1] for c in char_boxes)
-                x1 = max(c[2] for c in char_boxes)
-                y1 = max(c[3] for c in char_boxes)
+    # Detect lines
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
+                            minLineLength=50, maxLineGap=10)
 
-                results.append({
-                    "text": matched_str,
-                    "page": page_num + 1,
-                    "bbox": (x0, y0, x1, y1)
-                })
+    horizontal = []
+    vertical = []
 
-# Print the results
-for item in results:
-    print(item)
+    # Split lines by orientation
+    for l in lines:
+        x1,y1,x2,y2 = l[0]
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+
+        if abs(angle) < 10 or abs(angle) > 170:
+            horizontal.append((x1,y1,x2,y2))
+        elif abs(angle - 90) < 10 or abs(angle + 90) < 10:
+            vertical.append((x1,y1,x2,y2))
+
+    boxes = []
+
+    # For every pair of horizontal and vertical lines -> box candidate
+    for h1 in horizontal:
+        for h2 in horizontal:
+            if h1 is h2:
+                continue
+
+            for v1 in vertical:
+                for v2 in vertical:
+                    if v1 is v2:
+                        continue
+
+                    # Extend the lines
+                    h1e = extend_line(*h1)
+                    h2e = extend_line(*h2)
+                    v1e = extend_line(*v1)
+                    v2e = extend_line(*v2)
+
+                    # Compute corners
+                    p1 = intersection(h1e, v1e)
+                    p2 = intersection(h1e, v2e)
+                    p3 = intersection(h2e, v2e)
+                    p4 = intersection(h2e, v1e)
+
+                    if None in (p1,p2,p3,p4):
+                        continue
+
+                    box = np.array([p1,p2,p3,p4])
+
+                    # Filter small or weird shapes
+                    area = cv2.contourArea(box)
+                    if area < 500:
+                        continue
+
+                    boxes.append(box)
+                    cv2.polylines(img, [box], True, (0,255,0), 2)
+
+    return img
+
+
+# Run
+input_path = "drawing.png"
+output_path = "boxes_out.png"
+
+res = detect_boxes_parallel_perpendicular(input_path)
+cv2.imwrite(output_path, res)
+
+print("Done:", output_path)
