@@ -1,40 +1,74 @@
-import cv2
-import numpy as np
+import fitz
 import math
+import re
 
-def extend_line(x1, y1, x2, y2, scale=2000):
-    vx = x2 - x1
-    vy = y2 - y1
-    return (x1 - vx*scale, y1 - vy*scale, x2 + vx*scale, y2 + vy*scale)
 
-def intersection(l1, l2):
-    x1,y1,x2,y2 = l1
-    x3,y3,x4,y4 = l2
+def is_small_circle(path):
+    """Check whether a path is a tiny circle used as a degree symbol."""
+    if "c" not in path.get("items", {}):  
+        return False
 
-    denom = (x1-x2)*(y3-y4)-(y1-y2)*(x3-x4)
-    if abs(denom) < 1e-6:
-        return None
+    # circle approx via 4 cubic bezier curves (most CAD PDFs)
+    rect = path["rect"]
+    w = rect[2] - rect[0]
+    h = rect[3] - rect[1]
 
-    px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom
-    py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom
+    # tiny circle: ~1–5 px typically
+    return 0.5 < w < 8 and 0.5 < h < 8
 
-    return (int(px), int(py))
 
-def detect_boxes_parallel_perpendicular(img_path):
-    img = cv2.imread(img_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+pdf = "drawing.pdf"
+doc = fitz.open(pdf)
 
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+results = []
 
-    # Detect lines
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
-                            minLineLength=50, maxLineGap=10)
+for pno, page in enumerate(doc):
+    # 1) extract all paths
+    paths = page.get_drawings()
 
-    horizontal = []
-    vertical = []
+    # find all small circles (degree symbols)
+    degree_symbols = []
+    for p in paths:
+        if is_small_circle(p):
+            degree_symbols.append(p["rect"])
 
-    # Split lines by orientation
-    for l in lines:
+    # 2) extract text (chars)
+    chars = page.get_text("chars")
+
+    # detect numbers near circles
+    for circle in degree_symbols:
+        cx = (circle[0] + circle[2]) / 2
+        cy = (circle[1] + circle[3]) / 2
+
+        # find nearby numbers (within 40px)
+        nearby_chars = [
+            c for c in chars
+            if abs(c[1] - cy) < 20 and abs(c[0] - cx) < 40 and c[4].isdigit()
+        ]
+
+        if not nearby_chars:
+            continue
+
+        # group them to form number (e.g., '4','5' => "45")
+        x_sorted = sorted(nearby_chars, key=lambda c: c[0])
+        number = "".join(c[4] for c in x_sorted)
+
+        # return bounding boxes
+        num_bbox = (
+            min(c[0] for c in x_sorted),
+            min(c[1] for c in x_sorted),
+            max(c[2] for c in x_sorted),
+            max(c[3] for c in x_sorted),
+        )
+
+        results.append({
+            "text": number + "°",
+            "page": pno + 1,
+            "circle_bbox": circle,
+            "number_bbox": num_bbox
+        })
+
+print(results)    for l in lines:
         x1,y1,x2,y2 = l[0]
         angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
 
