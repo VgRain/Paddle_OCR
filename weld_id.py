@@ -1,71 +1,88 @@
-import fitz
-import math
-import re
+import os
+import cv2
+import numpy as np
+import albumentations as A
+from torch.utils.data import Dataset
+import torch
 
 
-def is_small_circle(path):
-    """Check whether a path is a tiny circle used as a degree symbol."""
-    if "c" not in path.get("items", {}):  
-        return False
+class YOLOv8_DualAugDataset(Dataset):
+    def __init__(self, img_dir, label_dir, img_size=640):
+        self.img_dir = img_dir
+        self.label_dir = label_dir
+        self.images = [f for f in os.listdir(img_dir) if f.endswith((".jpg", ".png"))]
+        self.img_size = img_size
 
-    # circle approx via 4 cubic bezier curves (most CAD PDFs)
-    rect = path["rect"]
-    w = rect[2] - rect[0]
-    h = rect[3] - rect[1]
+        # Original transform
+        self.t_original = A.Compose([
+            A.Resize(img_size, img_size)
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-    # tiny circle: ~1–5 px typically
-    return 0.5 < w < 8 and 0.5 < h < 8
+        # Blurred transform
+        self.t_blur = A.Compose([
+            A.Downscale(scale_min=0.5, scale_max=0.8, p=1.0),
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+            A.Resize(img_size, img_size)
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
+        # 90-degree rotation
+        self.t_rotate = A.Compose([
+            A.Rotate(limit=(90, 90), p=1.0),
+            A.Resize(img_size, img_size)
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-pdf = "drawing.pdf"
-doc = fitz.open(pdf)
+        # Blur + Rotate
+        self.t_blur_rotate = A.Compose([
+            A.Rotate(limit=(90, 90), p=1.0),
+            A.Downscale(scale_min=0.5, scale_max=0.8, p=1.0),
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+            A.Resize(img_size, img_size)
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-results = []
+    def __len__(self):
+        return len(self.images)
 
-for pno, page in enumerate(doc):
-    # 1) extract all paths
-    paths = page.get_drawings()
+    def load_label(self, label_path):
+        boxes, cls_ids = [], []
+        if os.path.exists(label_path):
+            with open(label_path, "r") as f:
+                for line in f.readlines():
+                    c, x, y, w, h = map(float, line.split())
+                    cls_ids.append(int(c))
+                    boxes.append([x, y, w, h])
+        return boxes, cls_ids
 
-    # find all small circles (degree symbols)
-    degree_symbols = []
-    for p in paths:
-        if is_small_circle(p):
-            degree_symbols.append(p["rect"])
+    def __getitem__(self, idx):
+        img_name = self.images[idx]
+        img_path = os.path.join(self.img_dir, img_name)
+        label_path = os.path.join(self.label_dir, img_name.rsplit(".", 1)[0] + ".txt")
 
-    # 2) extract text (chars)
-    chars = page.get_text("chars")
+        # Load Image
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    # detect numbers near circles
-    for circle in degree_symbols:
-        cx = (circle[0] + circle[2]) / 2
-        cy = (circle[1] + circle[3]) / 2
+        # Load Labels
+        boxes, cls_ids = self.load_label(label_path)
 
-        # find nearby numbers (within 40px)
-        nearby_chars = [
-            c for c in chars
-            if abs(c[1] - cy) < 20 and abs(c[0] - cx) < 40 and c[4].isdigit()
-        ]
+        # Generate 4 versions
+        o = self.t_original(image=image, bboxes=boxes, class_labels=cls_ids)
+        b = self.t_blur(image=image, bboxes=boxes, class_labels=cls_ids)
+        r = self.t_rotate(image=image, bboxes=boxes, class_labels=cls_ids)
+        br = self.t_blur_rotate(image=image, bboxes=boxes, class_labels=cls_ids)
 
-        if not nearby_chars:
-            continue
+        # Convert to YOLOv8 format
+        def convert(t):
+            img = torch.tensor(t["image"]).permute(2, 0, 1) / 255.0
+            labels = torch.tensor([[cls] + list(bb) for cls, bb in zip(t["class_labels"], t["bboxes"])])
+            return img, labels
 
-        # group them to form number (e.g., '4','5' => "45")
-        x_sorted = sorted(nearby_chars, key=lambda c: c[0])
-        number = "".join(c[4] for c in x_sorted)
+        img_o, lab_o = convert(o)
+        img_b, lab_b = convert(b)
+        img_r, lab_r = convert(r)
+        img_br, lab_br = convert(br)
 
-        # return bounding boxes
-        num_bbox = (
-            min(c[0] for c in x_sorted),
-            min(c[1] for c in x_sorted),
-            max(c[2] for c in x_sorted),
-            max(c[3] for c in x_sorted),
+        # Return 4x images + labels
+        return (
+            torch.stack([img_o, img_b, img_r, img_br]),   # shape: [4, 3, 640, 640]
+            [lab_o, lab_b, lab_r, lab_br]
         )
-
-        results.append({
-            "text": number + "°",
-            "page": pno + 1,
-            "circle_bbox": circle,
-            "number_bbox": num_bbox
-        })
-
-print(results)
