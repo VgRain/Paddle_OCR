@@ -1,88 +1,83 @@
-import os
 import cv2
 import numpy as np
-import albumentations as A
-from torch.utils.data import Dataset
-import torch
+
+def detect_arrows_and_lines(img_path):
+
+    img = cv2.imread(img_path)
+    original = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Binary threshold
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # ---- STEP 1: FIND CONTOURS (Arrow Candidates) ----
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    arrow_contours = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 200:  # ignore noise
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+        vertices = len(approx)
+
+        # Compute circularity
+        if peri == 0:
+            circularity = 1
+        else:
+            circularity = 4 * np.pi * area / (peri * peri)
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = w / float(h)
+
+        # ---- Arrow Condition ----
+        if (5 <= vertices <= 8) and (circularity < 0.6) and (aspect_ratio < 0.75 or aspect_ratio > 1.3):
+            arrow_contours.append(cnt)
+            cv2.drawContours(img, [cnt], -1, (0, 255, 0), 3)   # green = arrow
+
+    # ---- STEP 2: DETECT LINES (Hough Transform) ----
+
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
+                            minLineLength=50, maxLineGap=10)
+
+    detected_lines = []
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            detected_lines.append((x1, y1, x2, y2))
+            cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 2)  # blue = line
+
+    # ---- STEP 3: CHECK IF LINE PASSES THROUGH ARROW ----
+
+    for cnt in arrow_contours:
+
+        # Convert contour to mask
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], -1, 255, -1)
+
+        for (x1, y1, x2, y2) in detected_lines:
+
+            # Draw single-pixel line on mask
+            line_mask = np.zeros_like(mask)
+            cv2.line(line_mask, (x1, y1), (x2, y2), 255, 1)
+
+            # Intersection = bitwise AND
+            intersection = cv2.bitwise_and(mask, line_mask)
+
+            if np.sum(intersection) > 0:
+                # Highlight the intersection region in yellow
+                img[np.where(intersection > 0)] = (0, 255, 255)  # yellow
+
+    cv2.imshow("Arrows + Line Detection", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 
-class YOLOv8_DualAugDataset(Dataset):
-    def __init__(self, img_dir, label_dir, img_size=640):
-        self.img_dir = img_dir
-        self.label_dir = label_dir
-        self.images = [f for f in os.listdir(img_dir) if f.endswith((".jpg", ".png"))]
-        self.img_size = img_size
-
-        # Original transform
-        self.t_original = A.Compose([
-            A.Resize(img_size, img_size)
-        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
-
-        # Blurred transform
-        self.t_blur = A.Compose([
-            A.Downscale(scale_min=0.5, scale_max=0.8, p=1.0),
-            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-            A.Resize(img_size, img_size)
-        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
-
-        # 90-degree rotation
-        self.t_rotate = A.Compose([
-            A.Rotate(limit=(90, 90), p=1.0),
-            A.Resize(img_size, img_size)
-        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
-
-        # Blur + Rotate
-        self.t_blur_rotate = A.Compose([
-            A.Rotate(limit=(90, 90), p=1.0),
-            A.Downscale(scale_min=0.5, scale_max=0.8, p=1.0),
-            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-            A.Resize(img_size, img_size)
-        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
-
-    def __len__(self):
-        return len(self.images)
-
-    def load_label(self, label_path):
-        boxes, cls_ids = [], []
-        if os.path.exists(label_path):
-            with open(label_path, "r") as f:
-                for line in f.readlines():
-                    c, x, y, w, h = map(float, line.split())
-                    cls_ids.append(int(c))
-                    boxes.append([x, y, w, h])
-        return boxes, cls_ids
-
-    def __getitem__(self, idx):
-        img_name = self.images[idx]
-        img_path = os.path.join(self.img_dir, img_name)
-        label_path = os.path.join(self.label_dir, img_name.rsplit(".", 1)[0] + ".txt")
-
-        # Load Image
-        image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # Load Labels
-        boxes, cls_ids = self.load_label(label_path)
-
-        # Generate 4 versions
-        o = self.t_original(image=image, bboxes=boxes, class_labels=cls_ids)
-        b = self.t_blur(image=image, bboxes=boxes, class_labels=cls_ids)
-        r = self.t_rotate(image=image, bboxes=boxes, class_labels=cls_ids)
-        br = self.t_blur_rotate(image=image, bboxes=boxes, class_labels=cls_ids)
-
-        # Convert to YOLOv8 format
-        def convert(t):
-            img = torch.tensor(t["image"]).permute(2, 0, 1) / 255.0
-            labels = torch.tensor([[cls] + list(bb) for cls, bb in zip(t["class_labels"], t["bboxes"])])
-            return img, labels
-
-        img_o, lab_o = convert(o)
-        img_b, lab_b = convert(b)
-        img_r, lab_r = convert(r)
-        img_br, lab_br = convert(br)
-
-        # Return 4x images + labels
-        return (
-            torch.stack([img_o, img_b, img_r, img_br]),   # shape: [4, 3, 640, 640]
-            [lab_o, lab_b, lab_r, lab_br]
-        )
+# RUN
+detect_arrows_and_lines("input.jpg")
