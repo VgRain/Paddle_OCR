@@ -71,12 +71,16 @@ def detect_arrows_and_lines(img_path):
             intersection = cv2.bitwise_and(mask, line_mask)
 
             if np.sum(intersection) > 0:
-                # Highlight the intersection region in yellow
                 img[np.where(intersection > 0)] = (0, 255, 255)  # yellow
 
+    # ---- DISPLAY IMAGE ----
     cv2.imshow("Arrows + Line Detection", img)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+    # ---- SAVE IMAGE ----
+    cv2.imwrite("output.jpg", img)
+    print("Saved as output.jpg")
 
 
 # RUN
