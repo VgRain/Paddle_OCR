@@ -1,125 +1,149 @@
+import fitz               # PyMuPDF
 import cv2
 import numpy as np
-import pytesseract
-from pytesseract import Output
 
 class DimensionDetector:
+    def __init__(self, pdf_path):
+        self.pdf_path = pdf_path
+        self.doc = fitz.open(pdf_path)
+        self.page = self.doc[0]
+        self.text_blocks = []
+        self.image = None
 
-    def __init__(self):
-        self.kernel = np.ones((3, 3), np.uint8)
-
-    # ---------------------------------------------------------
-    # 1. Extract numbers (0–9) with angle correction
-    # ---------------------------------------------------------
-    def extract_numbers(self, img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        # tess config for picking numbers only
-        config = "--psm 6 -c tessedit_char_whitelist=0123456789()"
-        data = pytesseract.image_to_data(gray, output_type=Output.DICT, config=config)
+    # --------------------------------------------------------
+    # 1. Extract all numbers (multi-orientation)
+    # --------------------------------------------------------
+    def extract_numbers(self):
+        blocks = self.page.get_text("blocks")
 
         numbers = []
-        for i in range(len(data["text"])):
-            txt = data["text"][i].strip()
-            if txt == "":
-                continue
+        for b in blocks:
+            text = b[4]
+            bbox = b[:4]
 
-            x = data["left"][i]
-            y = data["top"][i]
-            w = data["width"][i]
-            h = data["height"][i]
+            # extract only pure numbers like: 20, 3, 10.5
+            if self._is_number(text):
+                numbers.append({"text": text, "bbox": bbox})
 
-            numbers.append({"text": txt, "bbox": (x, y, w, h)})
-
+        self.text_blocks = numbers
         return numbers
 
-    # ---------------------------------------------------------
-    # 2. Check if a horizontal line exists below the number
-    # ---------------------------------------------------------
-    def detect_line_below(self, img, bbox):
-        x, y, w, h = bbox
-        roi_y1 = y + h + 5
-        roi_y2 = y + h + 40  # scan 40px below text
+    def _is_number(self, text):
+        text = text.strip()
+        return text.replace(".", "", 1).isdigit()
 
-        roi = img[roi_y1:roi_y2, x-20:x+w+20]
-        if roi.size == 0:
-            return None
+    # --------------------------------------------------------
+    # 2. Render PDF page into image (for OpenCV)
+    # --------------------------------------------------------
+    def render_page(self, zoom=3):
+        mat = fitz.Matrix(zoom, zoom)
+        pix = self.page.get_pixmap(matrix=mat)
+        img = np.frombuffer(pix.samples, dtype=np.uint8)
+        img = img.reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        self.image = img
+        return img
 
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    # --------------------------------------------------------
+    # 3. Detect horizontal & vertical lines
+    # --------------------------------------------------------
+    def detect_lines(self):
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150)
 
-        # Hough line detection
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 40, minLineLength=40, maxLineGap=5)
+        # HORIZONTAL lines
+        horiz = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
+                                minLineLength=50, maxLineGap=5)
 
-        return lines
+        # VERTICAL lines
+        vert = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
+                               minLineLength=50, maxLineGap=5)
 
-    # ---------------------------------------------------------
-    # 3. Detect arrowheads at both ends of a line
-    # ---------------------------------------------------------
-    def detect_arrows(self, line_img):
-        gray = cv2.cvtColor(line_img, cv2.COLOR_BGR2GRAY)
-        th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+        return horiz, vert
 
-        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # --------------------------------------------------------
+    # 4. For each number, check if it has a line near it
+    # --------------------------------------------------------
+    def find_nearby_line(self, number):
+        x1, y1, x2, y2 = self._scale_bbox(number["bbox"])
+
+        horiz, vert = self.detect_lines()
+
+        number_y_center = (y1 + y2) / 2
+
+        nearby_lines = []
+        if horiz is not None:
+            for l in horiz:
+                xA, yA, xB, yB = l[0]
+                # horizontal threshold
+                if abs(yA - number_y_center) < 40:
+                    nearby_lines.append(l[0])
+
+        return nearby_lines
+
+    def _scale_bbox(self, bbox, zoom=3):
+        return [int(v * zoom) for v in bbox]
+
+    # --------------------------------------------------------
+    # 5. Detect arrowheads on a line (simple shape logic)
+    # --------------------------------------------------------
+    def has_two_arrows(self, line):
+        x1, y1, x2, y2 = line
+
+        roi = self._crop_line_region(x1, y1, x2, y2)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
+
+        contours, _ = cv2.findContours(th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         arrow_count = 0
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 20 or area > 3000:
-                continue
-
-            approx = cv2.approxPolyDP(cnt, 0.2 * cv2.arcLength(cnt, True), True)
-
-            # arrowhead tends to be triangular (3 corners)
-            if len(approx) == 3:
+        for c in contours:
+            area = cv2.contourArea(c)
+            if 30 < area < 500:  # arrowhead area range
                 arrow_count += 1
 
         return arrow_count >= 2
 
-    # ---------------------------------------------------------
-    # Master function
-    # ---------------------------------------------------------
-    def process(self, img):
+    def _crop_line_region(self, x1, y1, x2, y2):
+        pad = 15
+        x_min = max(0, min(x1, x2) - pad)
+        x_max = min(self.image.shape[1], max(x1, x2) + pad)
+        y_min = max(0, min(y1, y2) - pad)
+        y_max = min(self.image.shape[0], max(y1, y2) + pad)
+        return self.image[y_min:y_max, x_min:x_max]
+
+    # --------------------------------------------------------
+    # 6. Main pipeline
+    # --------------------------------------------------------
+    def run(self):
+        self.extract_numbers()
+        self.render_page()
+
         results = []
 
-        numbers = self.extract_numbers(img)
-
-        for item in numbers:
-            bbox = item["bbox"]
-            num = item["text"]
-
-            lines = self.detect_line_below(img, bbox)
-
-            if lines is not None:
-                # Extract region around the detected line to check arrowheads
-                x, y, w, h = bbox
-                roi = img[y+h+5:y+h+40, x-40:x+w+40]
-
-                has_arrows = self.detect_arrows(roi)
-
-                results.append({
-                    "number": num,
-                    "bbox": bbox,
-                    "line_found": True,
-                    "arrows": has_arrows
-                })
-            else:
-                results.append({
-                    "number": num,
-                    "bbox": bbox,
-                    "line_found": False,
-                    "arrows": False
-                })
+        for n in self.text_blocks:
+            lines = self.find_nearby_line(n)
+            for line in lines:
+                if self.has_two_arrows(line):
+                    results.append({
+                        "number": n["text"],
+                        "bbox": n["bbox"],
+                        "line": line,
+                        "has_arrows": True
+                    })
 
         return results
 
 
-det = DimensionDetector()
 
-img = cv2.imread("drawing.png")
+det = DimensionDetector("drawing.pdf")
 
-output = det.process(img)
+output = det.run()
 
-for item in output:
-    print(item)
+for d in output:
+    print("Number:", d["number"])
+    print("Box:", d["bbox"])
+    print("Line:", d["line"])
+    print("Two Arrows:", d["has_arrows"])
+    print("-------------")
