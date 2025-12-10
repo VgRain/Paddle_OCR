@@ -1,96 +1,80 @@
 import cv2
 import numpy as np
 
-class ArrowLineDetector:
+class ArrowDimensionDetector:
     def __init__(self, image_path):
-        self.image_path = image_path
         self.image = cv2.imread(image_path)
         self.gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-        self.edges = cv2.Canny(self.gray, 50, 150)
 
     # ----------------------------------------------------------
-    # 1. Detect lines
+    # 1. Detect arrowheads (triangles)
     # ----------------------------------------------------------
-    def detect_lines(self):
-        lines = cv2.HoughLinesP(
-            self.edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=80,
-            minLineLength=40,
-            maxLineGap=10
-        )
-        return [] if lines is None else lines[:, 0]
-
-    # ----------------------------------------------------------
-    # 2. Crop area around the line to inspect arrowheads
-    # ----------------------------------------------------------
-    def crop_line_region(self, x1, y1, x2, y2, pad=25):
-        x_min = max(0, min(x1, x2) - pad)
-        x_max = min(self.image.shape[1], max(x1, x2) + pad)
-        y_min = max(0, min(y1, y2) - pad)
-        y_max = min(self.image.shape[0], max(y1, y2) + pad)
-        return self.image[y_min:y_max, x_min:x_max]
-
-    # ----------------------------------------------------------
-    # 3. Detect arrowheads in the cropped line region
-    # ----------------------------------------------------------
-    def has_two_arrows(self, roi):
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
+    def detect_arrowheads(self):
+        _, th = cv2.threshold(self.gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        arrow_count = 0
+        arrows = []
+
         for c in contours:
             area = cv2.contourArea(c)
-            if 20 < area < 400:   # typical arrowhead size range
-                peri = cv2.arcLength(c, True)
-                approx = cv2.approxPolyDP(c, 0.3 * peri, True)
 
-                # Arrowheads look like triangles
-                if len(approx) == 3:
-                    arrow_count += 1
+            # filter noise and big shapes
+            if area < 20 or area > 800:
+                continue
 
-        return arrow_count >= 2
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.25 * peri, True)
 
-    # ----------------------------------------------------------
-    # 4. Main logic: keep only lines with 2 arrowheads
-    # ----------------------------------------------------------
-    def get_lines_with_arrows(self):
-        lines = self.detect_lines()
-        valid_lines = []
+            # triangle → arrowhead
+            if len(approx) == 3:
+                M = cv2.moments(c)
+                if M["m00"] == 0:
+                    continue
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                arrows.append((cx, cy))
 
-        for (x1, y1, x2, y2) in lines:
-            roi = self.crop_line_region(x1, y1, x2, y2)
-            if self.has_two_arrows(roi):
-                valid_lines.append((x1, y1, x2, y2))
-
-        return valid_lines
+        return arrows
 
     # ----------------------------------------------------------
-    # 5. Display the good lines only
+    # 2. Pair arrowheads and create a line between them
     # ----------------------------------------------------------
-    def show_results(self, lines):
+    def pair_arrows(self, arrows, max_dist=600):
+        lines = []
+
+        for i in range(len(arrows)):
+            for j in range(i+1, len(arrows)):
+                (x1, y1), (x2, y2) = arrows[i], arrows[j]
+
+                # distance between arrowheads
+                dist = np.hypot(x2 - x1, y2 - y1)
+
+                # pair only close arrowheads (dimension line)
+                if 30 < dist < max_dist:
+                    lines.append((x1, y1, x2, y2))
+
+        return lines
+
+    # ----------------------------------------------------------
+    # 3. Display all detected dimension lines
+    # ----------------------------------------------------------
+    def show_lines(self, lines):
         out = self.image.copy()
         for (x1, y1, x2, y2) in lines:
             cv2.line(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
-        cv2.imshow("Lines With Two Arrows", out)
+        cv2.imshow("Dimension Lines", out)
         cv2.waitKey(0)
-        cv2.destroyAllWindows()
 
+    # ----------------------------------------------------------
+    # Main function
+    # ----------------------------------------------------------
+    def run(self):
+        arrows = self.detect_arrowheads()
 
-# ----------------------------------------------------------
-# Usage
-# ----------------------------------------------------------
-if __name__ == "__main__":
-    det = ArrowLineDetector("your_image.png")
+        if len(arrows) < 2:
+            print("No arrow pair detected.")
+            return []
 
-    good_lines = det.get_lines_with_arrows()
-
-    print("Detected lines with 2 arrows:")
-    for l in good_lines:
-        print(l)
-
-    det.show_results(good_lines)
+        lines = self.pair_arrows(arrows)
+        return lines
