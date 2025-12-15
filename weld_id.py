@@ -2,154 +2,164 @@ import cv2
 import numpy as np
 import math
 
-# -------------------------------
-# 1. Extend a detected line
-# -------------------------------
-def extend_line(x1, y1, x2, y2, extend_len=80):
-    dx = x2 - x1
-    dy = y2 - y1
+# -----------------------------------
+# Utility: Extend a line
+# -----------------------------------
+def extend_line(x1, y1, x2, y2, extend=80):
+    dx, dy = x2 - x1, y2 - y1
     length = math.hypot(dx, dy)
-
     if length == 0:
         return None
 
-    ux = dx / length
-    uy = dy / length
-
-    sx = int(x1 - extend_len * ux)
-    sy = int(y1 - extend_len * uy)
-    ex = int(x2 + extend_len * ux)
-    ey = int(y2 + extend_len * uy)
-
+    ux, uy = dx / length, dy / length
+    sx, sy = int(x1 - ux * extend), int(y1 - uy * extend)
+    ex, ey = int(x2 + ux * extend), int(y2 + uy * extend)
     return (sx, sy), (ex, ey)
 
-# -------------------------------
-# 2. Extract ROI at line ends
-# -------------------------------
-def extract_end_roi(img, x, y, size=35):
+# -----------------------------------
+# Utility: Extract ROI
+# -----------------------------------
+def extract_roi(img, x, y, size=35):
     h, w = img.shape[:2]
-    x1 = max(0, x - size)
-    y1 = max(0, y - size)
-    x2 = min(w, x + size)
-    y2 = min(h, y + size)
-    return img[y1:y2, x1:x2]
+    return img[max(0,y-size):min(h,y+size),
+               max(0,x-size):min(w,x+size)]
 
-# -------------------------------
-# 3. Arrow detection
-# -------------------------------
+# -----------------------------------
+# Utility: Remove line near arrow
+# -----------------------------------
+def suppress_line(mask, x, y, r=15):
+    cv2.circle(mask, (x, y), r, 0, -1)
+
+# -----------------------------------
+# Arrow detection (triangle-based)
+# -----------------------------------
 def detect_arrow(roi):
     if roi.size == 0:
         return False
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-
     contours, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 100:
+        if area < 80:
             continue
 
         peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
 
-        # Arrow head usually triangular / polygonal
-        if 3 <= len(approx) <= 6:
+        # Engineering arrow head ≈ triangle
+        if len(approx) == 3:
             return True
 
     return False
 
-# -------------------------------
-# 4. Main pipeline
-# -------------------------------
-def detect_arrow_lines(image_path):
+# -----------------------------------
+# Remove overlapping / duplicate lines
+# -----------------------------------
+def remove_duplicates(lines, tol=10):
+    filtered = []
+    for l in lines:
+        x1,y1,x2,y2 = l
+        duplicate = False
+        for f in filtered:
+            if (abs(x1-f[0]) < tol and abs(y1-f[1]) < tol and
+                abs(x2-f[2]) < tol and abs(y2-f[3]) < tol):
+                duplicate = True
+                break
+        if not duplicate:
+            filtered.append(l)
+    return filtered
+
+# -----------------------------------
+# MAIN PIPELINE
+# -----------------------------------
+def process_engineering_drawing(image_path):
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError("Image not found")
 
-    output = img.copy()
-
+    out = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(blur, 50, 150)
 
-    # Line detection (best for engineering drawings)
-    lines = cv2.HoughLinesP(
+    # --- Binary image ---
+    _, bw = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # --- TEXT REMOVAL (CRITICAL) ---
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+
+    text_removed = cv2.morphologyEx(bw, cv2.MORPH_OPEN, h_kernel)
+    text_removed |= cv2.morphologyEx(bw, cv2.MORPH_OPEN, v_kernel)
+
+    # --- Line detection ---
+    edges = cv2.Canny(text_removed, 50, 150)
+
+    raw_lines = cv2.HoughLinesP(
         edges,
         rho=1,
-        theta=np.pi / 180,
-        threshold=80,
-        minLineLength=50,
-        maxLineGap=10
+        theta=np.pi/180,
+        threshold=120,
+        minLineLength=120,
+        maxLineGap=5
     )
 
-    if lines is None:
-        print("No lines detected")
-        return output
+    if raw_lines is None:
+        return out
 
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
+    lines = [l[0] for l in raw_lines]
+    lines = remove_duplicates(lines)
 
-        extended = extend_line(x1, y1, x2, y2)
-        if extended is None:
+    # --- Arrow mask (copy of binary) ---
+    arrow_mask = bw.copy()
+
+    results = []
+
+    # --- Process each line ---
+    for x1,y1,x2,y2 in lines:
+        extended = extend_line(x1,y1,x2,y2)
+        if not extended:
             continue
 
         start, end = extended
 
-        roi_start = extract_end_roi(img, start[0], start[1])
-        roi_end = extract_end_roi(img, end[0], end[1])
+        # Suppress line near endpoints (KEY FIX)
+        suppress_line(arrow_mask, start[0], start[1])
+        suppress_line(arrow_mask, end[0], end[1])
 
-        arrow_start = detect_arrow(roi_start)
-        arrow_end = detect_arrow(roi_end)
+        roi_start = extract_roi(arrow_mask, start[0], start[1])
+        roi_end   = extract_roi(arrow_mask, end[0], end[1])
+
+        arrow_s = detect_arrow(roi_start)
+        arrow_e = detect_arrow(roi_end)
 
         # Classification
-        if arrow_start and arrow_end:
-            color = (0, 255, 0)     # Dimension line
-            label = "DIMENSION"
-        elif arrow_start or arrow_end:
-            color = (0, 165, 255)   # Leader line
-            label = "LEADER"
+        if arrow_s and arrow_e:
+            label, color = "DIMENSION", (0,255,0)
+        elif arrow_s or arrow_e:
+            label, color = "LEADER", (0,165,255)
         else:
-            color = (200, 200, 200) # Normal line
-            label = "LINE"
+            label, color = "LINE", (200,200,200)
 
-        # Draw results
-        cv2.line(output, start, end, color, 2)
-        cv2.putText(
-            output,
-            label,
-            (x1, y1 - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            color,
-            1
-        )
+        results.append((start, end, label, color))
 
-        # Visualize ROIs (debug)
-        cv2.rectangle(output,
-                       (start[0]-35, start[1]-35),
-                       (start[0]+35, start[1]+35),
-                       (255, 0, 0), 1)
+    # --- Draw results ---
+    for start, end, label, color in results:
+        cv2.line(out, start, end, color, 2)
+        cv2.putText(out, label, (start[0], start[1]-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        cv2.rectangle(output,
-                       (end[0]-35, end[1]-35),
-                       (end[0]+35, end[1]+35),
-                       (255, 0, 0), 1)
+    return out
 
-    return output
-
-# -------------------------------
-# 5. Run
-# -------------------------------
+# -----------------------------------
+# RUN
+# -----------------------------------
 if __name__ == "__main__":
-    image_path = "engineering_drawing.png"  # <-- change this
-    result = detect_arrow_lines(image_path)
+    img_path = "engineering_drawing.png"  # change path
+    result = process_engineering_drawing(img_path)
 
-    cv2.imshow("Arrow Line Detection", result)
-    cv2.imwrite("output_detected.png", result)
+    cv2.imshow("Final Result", result)
+    cv2.imwrite("final_output.png", result)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
