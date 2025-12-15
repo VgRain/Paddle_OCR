@@ -1,80 +1,155 @@
 import cv2
 import numpy as np
+import math
 
-class ArrowDimensionDetector:
-    def __init__(self, image_path):
-        self.image = cv2.imread(image_path)
-        self.gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+# -------------------------------
+# 1. Extend a detected line
+# -------------------------------
+def extend_line(x1, y1, x2, y2, extend_len=80):
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.hypot(dx, dy)
 
-    # ----------------------------------------------------------
-    # 1. Detect arrowheads (triangles)
-    # ----------------------------------------------------------
-    def detect_arrowheads(self):
-        _, th = cv2.threshold(self.gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if length == 0:
+        return None
 
-        arrows = []
+    ux = dx / length
+    uy = dy / length
 
-        for c in contours:
-            area = cv2.contourArea(c)
+    sx = int(x1 - extend_len * ux)
+    sy = int(y1 - extend_len * uy)
+    ex = int(x2 + extend_len * ux)
+    ey = int(y2 + extend_len * uy)
 
-            # filter noise and big shapes
-            if area < 20 or area > 800:
-                continue
+    return (sx, sy), (ex, ey)
 
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.25 * peri, True)
+# -------------------------------
+# 2. Extract ROI at line ends
+# -------------------------------
+def extract_end_roi(img, x, y, size=35):
+    h, w = img.shape[:2]
+    x1 = max(0, x - size)
+    y1 = max(0, y - size)
+    x2 = min(w, x + size)
+    y2 = min(h, y + size)
+    return img[y1:y2, x1:x2]
 
-            # triangle → arrowhead
-            if len(approx) == 3:
-                M = cv2.moments(c)
-                if M["m00"] == 0:
-                    continue
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                arrows.append((cx, cy))
+# -------------------------------
+# 3. Arrow detection
+# -------------------------------
+def detect_arrow(roi):
+    if roi.size == 0:
+        return False
 
-        return arrows
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-    # ----------------------------------------------------------
-    # 2. Pair arrowheads and create a line between them
-    # ----------------------------------------------------------
-    def pair_arrows(self, arrows, max_dist=600):
-        lines = []
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-        for i in range(len(arrows)):
-            for j in range(i+1, len(arrows)):
-                (x1, y1), (x2, y2) = arrows[i], arrows[j]
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 100:
+            continue
 
-                # distance between arrowheads
-                dist = np.hypot(x2 - x1, y2 - y1)
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
 
-                # pair only close arrowheads (dimension line)
-                if 30 < dist < max_dist:
-                    lines.append((x1, y1, x2, y2))
+        # Arrow head usually triangular / polygonal
+        if 3 <= len(approx) <= 6:
+            return True
 
-        return lines
+    return False
 
-    # ----------------------------------------------------------
-    # 3. Display all detected dimension lines
-    # ----------------------------------------------------------
-    def show_lines(self, lines):
-        out = self.image.copy()
-        for (x1, y1, x2, y2) in lines:
-            cv2.line(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
+# -------------------------------
+# 4. Main pipeline
+# -------------------------------
+def detect_arrow_lines(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError("Image not found")
 
-        cv2.imshow("Dimension Lines", out)
-        cv2.waitKey(0)
+    output = img.copy()
 
-    # ----------------------------------------------------------
-    # Main function
-    # ----------------------------------------------------------
-    def run(self):
-        arrows = self.detect_arrowheads()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-        if len(arrows) < 2:
-            print("No arrow pair detected.")
-            return []
+    # Line detection (best for engineering drawings)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=50,
+        maxLineGap=10
+    )
 
-        lines = self.pair_arrows(arrows)
-        return lines
+    if lines is None:
+        print("No lines detected")
+        return output
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+
+        extended = extend_line(x1, y1, x2, y2)
+        if extended is None:
+            continue
+
+        start, end = extended
+
+        roi_start = extract_end_roi(img, start[0], start[1])
+        roi_end = extract_end_roi(img, end[0], end[1])
+
+        arrow_start = detect_arrow(roi_start)
+        arrow_end = detect_arrow(roi_end)
+
+        # Classification
+        if arrow_start and arrow_end:
+            color = (0, 255, 0)     # Dimension line
+            label = "DIMENSION"
+        elif arrow_start or arrow_end:
+            color = (0, 165, 255)   # Leader line
+            label = "LEADER"
+        else:
+            color = (200, 200, 200) # Normal line
+            label = "LINE"
+
+        # Draw results
+        cv2.line(output, start, end, color, 2)
+        cv2.putText(
+            output,
+            label,
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            color,
+            1
+        )
+
+        # Visualize ROIs (debug)
+        cv2.rectangle(output,
+                       (start[0]-35, start[1]-35),
+                       (start[0]+35, start[1]+35),
+                       (255, 0, 0), 1)
+
+        cv2.rectangle(output,
+                       (end[0]-35, end[1]-35),
+                       (end[0]+35, end[1]+35),
+                       (255, 0, 0), 1)
+
+    return output
+
+# -------------------------------
+# 5. Run
+# -------------------------------
+if __name__ == "__main__":
+    image_path = "engineering_drawing.png"  # <-- change this
+    result = detect_arrow_lines(image_path)
+
+    cv2.imshow("Arrow Line Detection", result)
+    cv2.imwrite("output_detected.png", result)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
